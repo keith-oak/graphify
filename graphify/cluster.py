@@ -211,7 +211,7 @@ def cluster(
     final_communities: list[list[str]] = []
     for nodes in raw.values():
         if len(nodes) > max_size:
-            final_communities.extend(_split_community(G, nodes, resolution))
+            final_communities.extend(_split_community_escalating(G, nodes, resolution))
         else:
             final_communities.append(nodes)
 
@@ -220,7 +220,7 @@ def cluster(
     second_pass: list[list[str]] = []
     for nodes in final_communities:
         if len(nodes) >= _COHESION_SPLIT_MIN_SIZE and cohesion_score(G, nodes) < _COHESION_SPLIT_THRESHOLD:
-            splits = _split_community(G, nodes, resolution)
+            splits = _split_community_escalating(G, nodes, resolution)
             second_pass.extend(splits if len(splits) > 1 else [nodes])
         else:
             second_pass.append(nodes)
@@ -257,6 +257,32 @@ def _split_community(G: nx.Graph, nodes: list[str], resolution: float = 1.0) -> 
         return [sorted(v) for v in sub_communities.values()]
     except Exception:
         return [sorted(nodes)]
+
+
+_SPLIT_RESOLUTION_ESCALATION = (2.0, 4.0, 8.0)
+
+
+def _split_community_escalating(G: nx.Graph, nodes: list[str], base_resolution: float = 1.0) -> list[list[str]]:
+    """Retry _split_community at increasing resolution until it actually separates
+    the community, instead of re-running the same resolution and giving up.
+
+    LOCAL PATCH — not upstream. A community that fails to split at its own
+    clustering resolution usually is not one real thing: it is nodes bridged by
+    shared boilerplate/utility edges (AckParam/GuidParam/OdataResp-style param
+    helpers reused across unrelated domains) whose edges dominate at that
+    resolution regardless of domain. Resolution is exactly the granularity lever,
+    so escalating it is what breaks these apart. Stops at the first resolution
+    that finds a real split, so a community that only narrowly failed the base
+    pass is never over-fragmented.
+    """
+    result = _split_community(G, nodes, resolution=base_resolution)
+    if len(result) > 1:
+        return result
+    for mult in _SPLIT_RESOLUTION_ESCALATION:
+        result = _split_community(G, nodes, resolution=base_resolution * mult)
+        if len(result) > 1:
+            return result
+    return [sorted(nodes)]
 
 
 def cohesion_score(G: nx.Graph, community_nodes: list[str]) -> float:
