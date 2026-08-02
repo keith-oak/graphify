@@ -216,4 +216,7 @@ def test_cluster_forwards_resolution_to_split_passes(monkeypatch):
 
     cluster_mod.cluster(G, resolution=0.5)
     assert seen, "expected the oversized-community split path to run"
-    assert set(seen) == {0.5}
+    # The local escalation patch retries at 2x/4x/8x when the fake returns a
+    # single group, so later entries are multiples — the first must be the base.
+    assert seen[0] == 0.5
+    assert set(seen) <= {0.5, 1.0, 2.0, 4.0}
