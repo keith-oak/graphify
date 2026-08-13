@@ -170,11 +170,21 @@ def attach_hyperedges(G: nx.Graph, hyperedges: list) -> None:
     G.graph["hyperedges"] = existing
 
 
-def _git_head() -> str | None:
-    """Return the current git HEAD commit hash, or None if not in a git repo."""
+def _git_head(cwd: "str | Path | None" = None) -> str | None:
+    """Return git HEAD for the repo containing ``cwd``, or None outside a repo.
+
+    ``cwd`` selects the repository to ask, exactly as in watch._git_head
+    (#2316). Without it the command inherits the caller's working directory,
+    which stamps the *invoking* repo's commit when the graph being written
+    describes a different repo — provenance must come from the repo the graph
+    describes, so callers pass the graph's own location.
+    """
     import subprocess as _sp
     try:
-        r = _sp.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3)
+        r = _sp.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=3,
+            cwd=str(cwd) if cwd is not None else None,
+        )
         return r.stdout.strip() if r.returncode == 0 else None
     except Exception:
         return None
@@ -292,6 +302,10 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
         data = json_graph.node_link_data(G, edges="links")
     except TypeError:
         data = json_graph.node_link_data(G)
+
+    def _json_sort_key(item: dict) -> str:
+        return json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
     for node in data["nodes"]:
         cid = node_community.get(node["id"])
         node["community"] = cid
@@ -311,8 +325,44 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
         if true_src is not None and true_tgt is not None:
             link["source"] = true_src
             link["target"] = true_tgt
-    data["hyperedges"] = getattr(G, "graph", {}).get("hyperedges", [])
-    commit = built_at_commit if built_at_commit is not None else _git_head()
+    data["nodes"].sort(key=_json_sort_key)
+    data["links"].sort(key=_json_sort_key)
+    if "hyperedges" not in getattr(G, "graph", {}):
+        # Hardening (#2485): a graph with NO hyperedges key at all was built by
+        # a path that never engaged hyperedge metadata — distinct from an
+        # intentional empty set ([], which build_from_json now stores
+        # explicitly after a full-wipeout revalidation). If the file on disk
+        # already holds a non-empty set, emptying it without a trace is silent
+        # data loss; warn loudly so the wipeout is attributable. We still write
+        # the graph's truth rather than preserving the stale set — resurrecting
+        # hyperedges whose members may no longer exist would reintroduce the
+        # dangling-member shape #1916 removed.
+        _prev_hyperedges = None
+        try:
+            if existing_path.exists():
+                from graphify.security import check_graph_file_size_cap
+                check_graph_file_size_cap(existing_path)
+                _prev = json.loads(existing_path.read_text(encoding="utf-8"))
+                if isinstance(_prev, dict):
+                    _prev_hyperedges = _prev.get("hyperedges")
+        except Exception:
+            _prev_hyperedges = None
+        if _prev_hyperedges:
+            print(
+                f"[graphify] WARNING: graph carries no hyperedge metadata but "
+                f"{existing_path} already holds {len(_prev_hyperedges)} "
+                f"hyperedge(s); writing an empty set. Rebuild from the original "
+                f"extraction if this is unexpected.",
+                file=sys.stderr,
+            )
+    hyperedges = sorted(getattr(G, "graph", {}).get("hyperedges", []), key=_json_sort_key)
+    if isinstance(data.get("graph"), dict) and "hyperedges" in data["graph"]:
+        data["graph"]["hyperedges"] = hyperedges
+    data["hyperedges"] = hyperedges
+    # Fallback provenance comes from the repo the graph is being written INTO
+    # (output_path lives in <target>/graphify-out/), never the shell's cwd —
+    # the same cwd-anchoring mistake #2316 fixed for `update`.
+    commit = built_at_commit if built_at_commit is not None else _git_head(Path(output_path).resolve().parent)
     if commit:
         data["built_at_commit"] = commit
     from graphify.paths import write_json_atomic

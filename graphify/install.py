@@ -17,6 +17,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import sys
 from pathlib import Path
 from typing import NoReturn
@@ -165,6 +166,13 @@ def _install_skill_references(skill_dst: Path, refs_src: Path) -> None:
         shutil.rmtree(refs_staged)
     try:
         shutil.copytree(refs_src, refs_staged)
+        # copytree preserves the source's mode bits, and a packaged bundle can
+        # be read-only: a Nix store path, a root-owned site-packages, a
+        # container image layer. Renaming a directory needs write permission on
+        # the directory itself, to update its ".." entry, so the os.replace
+        # below would fail with EACCES. Restore owner-write on the staged copy.
+        for path in (refs_staged, *refs_staged.rglob("*")):
+            path.chmod(path.stat().st_mode | stat.S_IWUSR)
         if refs_dst.exists():
             shutil.rmtree(refs_dst)
         os.replace(refs_staged, refs_dst)
@@ -670,6 +678,9 @@ def install(platform: str = "claude", *, project: bool = False, project_dir: Pat
     print("Done. Open your AI coding assistant and type:")
     print()
     print("  /graphify .")
+    print()
+    print("Prefer a hosted version? Early access to the graphify platform is")
+    print("open free before the public v1 launch: https://app.graphify.com")
     print()
 def _print_install_usage() -> None:
     platforms = ", ".join([*_PLATFORM_CONFIG, "gemini", "cursor"])
