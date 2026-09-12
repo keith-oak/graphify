@@ -24,6 +24,11 @@ _TSCONFIG_BASEURL_CACHE: "dict[str, Path | None]" = {}
 
 _WORKSPACE_MANIFEST_NAMES = ("pnpm-workspace.yaml", "package.json")
 
+# Nearest package.json `imports` map (Node subpath imports), keyed by the
+# resolved start directory. Same lifetime rule as _TSCONFIG_ALIAS_CACHE: no
+# mtime component, so extract() clears it per run.
+_PACKAGE_IMPORTS_CACHE: "dict[str, tuple[Path, dict] | None]" = {}
+
 _JS_RESOLVE_EXTS = (".ts", ".tsx", ".mts", ".cts", ".svelte", ".js", ".jsx", ".mjs", ".cjs")
 
 _JS_INDEX_FILES = ("index.ts", "index.tsx", "index.svelte", "index.js", "index.jsx", "index.mjs")
@@ -505,6 +510,120 @@ def _resolve_workspace_import(raw: str, start_dir: Path) -> Path | None:
                 return resolved
     return None
 
+def _find_js_project_anchor(start_dir: Path) -> Path:
+    """Discover the project root anchor for unmapped JS/TS convention aliases (#3357).
+
+    Walks upward from start_dir looking for:
+    1. Nearest directory containing package.json or pnpm-workspace.yaml
+    2. Nearest directory containing a VCS marker (_find_vcs_root)
+    3. Fallback: start_dir itself
+    """
+    from graphify.detect import _find_vcs_root
+
+    current = start_dir.resolve()
+    home = Path.home()
+
+    for candidate in [current, *current.parents]:
+        if candidate == home:
+            break
+        if (candidate / "package.json").is_file() or (candidate / "pnpm-workspace.yaml").is_file():
+            return candidate
+
+    vcs_root = _find_vcs_root(start_dir)
+    if vcs_root is not None:
+        return vcs_root
+
+    return current
+
+
+def _load_package_imports(start_dir: Path) -> "tuple[Path, dict] | None":
+    """Nearest package.json `imports` map walking up from start_dir.
+
+    Node subpath imports (https://nodejs.org/api/packages.html#subpath-imports):
+    keys start with `#`, values are relative targets or condition objects, and
+    the map applies to every file inside that package. AdonisJS 6 scaffolds
+    `"#services/*": "./app/services/*.js"` and imports through it everywhere;
+    without this map ~90% of an Adonis app's imports resolved to nothing and
+    `affected` saw only the handful of files using relative paths. Unlike
+    tsconfig `paths`, a nested tsconfig (e.g. `inertia/tsconfig.json`) cannot
+    shadow it, which matches how Node and tsc actually resolve these.
+
+    Returns (package_dir, imports) or None. The nearest package.json wins even
+    when it has no `imports` (Node never walks past the enclosing package).
+    """
+    current = start_dir.resolve()
+    key = str(current)
+    if key in _PACKAGE_IMPORTS_CACHE:
+        return _PACKAGE_IMPORTS_CACHE[key]
+    result: "tuple[Path, dict] | None" = None
+    for candidate in [current, *current.parents]:
+        manifest = candidate / "package.json"
+        if manifest.is_file():
+            data = _read_json_config(manifest)
+            imports = data.get("imports") if isinstance(data, dict) else None
+            if isinstance(imports, dict) and imports:
+                result = (candidate, imports)
+            break
+    _PACKAGE_IMPORTS_CACHE[key] = result
+    return result
+
+def _match_subpath_import(raw: str, pattern: str) -> "tuple[int, str, bool] | None":
+    """Node semantics for an `imports` key: exact match, or a single `*` wildcard.
+
+    Stricter than _match_tsconfig_alias on purpose: `#utils` must NOT match
+    `#utils/x` (Node treats a non-wildcard key as an exact specifier). Returns
+    (specificity, captured, is_wildcard); lower specificity wins, longest
+    literal prefix first among wildcards, mirroring Node's pattern ranking.
+    """
+    if "*" in pattern:
+        if pattern.count("*") != 1:
+            return None
+        prefix, suffix = pattern.split("*", 1)
+        if not raw.startswith(prefix) or not raw.endswith(suffix):
+            return None
+        end = len(raw) - len(suffix) if suffix else len(raw)
+        if end < len(prefix):
+            return None
+        return -len(prefix), raw[len(prefix):end], True
+    if raw == pattern:
+        return -(len(pattern) + 1_000_000), "", False
+    return None
+
+def _resolve_package_import(raw: str, start_dir: Path) -> "Path | None":
+    """Resolve a `#subpath` specifier through package.json `imports` to a local file.
+
+    Only local targets (`./…`) are followed: a value naming an external package
+    (`"#dep": "dep-node-native"`) is a third-party dependency and must keep the
+    existing external-reference behavior in _resolve_js_import_target.
+    """
+    if not raw.startswith("#"):
+        return None
+    loaded = _load_package_imports(start_dir)
+    if loaded is None:
+        return None
+    package_dir, imports = loaded
+    best: "tuple[int, str, bool, object] | None" = None
+    for pattern, value in imports.items():
+        if not isinstance(pattern, str) or not pattern.startswith("#"):
+            continue
+        match = _match_subpath_import(raw, pattern)
+        if match is None:
+            continue
+        specificity, captured, is_wildcard = match
+        if best is None or specificity < best[0]:
+            best = (specificity, captured, is_wildcard, value)
+    if best is None:
+        return None
+    _, captured, is_wildcard, value = best
+    target = _resolve_export_target(value)
+    if not isinstance(target, str) or not target.startswith("./"):
+        return None
+    if is_wildcard:
+        target = target.replace("*", captured, 1) if captured else target
+    candidate = Path(os.path.normpath(package_dir / target))
+    resolved = _resolve_js_import_path(candidate)
+    return resolved if resolved.is_file() else None
+
 def _resolve_js_module_path(raw: str | Path, start_dir: Path | None = None) -> Path | None:
     """Resolve a JS/TS module path or specifier to a local source file.
 
@@ -526,7 +645,32 @@ def _resolve_js_module_path(raw: str | Path, start_dir: Path | None = None) -> P
     if hit is not None:
         return _resolve_js_import_path(hit)
 
-    return _resolve_workspace_import(raw, start_dir)
+    # Node subpath imports (`#services/foo` via package.json `imports`). Tried
+    # after tsconfig `paths` so an explicit alias keeps precedence (#1269).
+    if raw.startswith("#"):
+        hit = _resolve_package_import(raw, start_dir)
+        if hit is not None:
+            return hit
+
+    workspace_hit = _resolve_workspace_import(raw, start_dir)
+    if workspace_hit is not None:
+        return workspace_hit
+
+    # Unmapped `@/` project-root convention fallback (#3357).
+    # Active ONLY when NO tsconfig.json or jsconfig.json exists anywhere in the upward tree.
+    if raw.startswith("@/") and _find_js_config(start_dir) is None:
+        subpath = raw[2:]
+        if subpath:
+            anchor = _find_js_project_anchor(start_dir)
+            if (anchor / "src").is_dir():
+                cand = _resolve_js_import_path(anchor / "src" / subpath)
+                if cand.is_file():
+                    return cand
+            cand = _resolve_js_import_path(anchor / subpath)
+            if cand.is_file():
+                return cand
+
+    return None
 
 def _resolve_js_import_target(raw: str, str_path: str) -> "tuple[str, Path | None] | None":
     """Resolve a JS/TS import path string to (target_nid, resolved_path).
@@ -842,13 +986,28 @@ def _apply_symbol_resolution_facts(
     path_by_resolved = {path.resolve(): path for path in paths}
     source_file_id = {path.resolve(): _make_id(str(path)) for path in paths}
     symbol_nodes: dict[tuple[Path, str], str] = {}
+    # Member nodes (`.method()` labels) share their bare name with top-level
+    # symbols once the leading dot is stripped. A module can only re-export
+    # top-level bindings, so a star-export walk must never bind an imported
+    # name to a class/interface member (#3436). Track those keys separately
+    # and never let a member shadow a same-named top-level symbol.
+    member_symbol_keys: set[tuple[Path, str]] = set()
     for node in nodes:
         source_path = _js_source_path(str(node.get("source_file", "")), root)
         if source_path is None:
             continue
-        label = str(node.get("label", "")).strip().strip("()").lstrip(".")
-        if label and node.get("id"):
-            symbol_nodes[(source_path, label)] = str(node["id"])
+        raw_label = str(node.get("label", "")).strip()
+        label = raw_label.strip("()").lstrip(".")
+        if not label or not node.get("id"):
+            continue
+        key = (source_path, label)
+        if raw_label.startswith("."):
+            if key in symbol_nodes:
+                continue
+            member_symbol_keys.add(key)
+        else:
+            member_symbol_keys.discard(key)
+        symbol_nodes[key] = str(node["id"])
 
     def ensure_symbol_node(path: Path, name: str, line: int) -> str:
         resolved_path = path.resolve()
@@ -1033,10 +1192,10 @@ def _apply_symbol_resolution_facts(
             return resolve_exported_origin(origin[0], origin[1], seen)
         for star_target in star_exports_by_file.get(target_path, []):
             star_key = (star_target, imported_name)
-            if star_key in symbol_nodes:
+            if star_key in symbol_nodes and star_key not in member_symbol_keys:
                 return star_key
             resolved = resolve_exported_origin(star_target, imported_name, seen)
-            if resolved in symbol_nodes:
+            if resolved in symbol_nodes and resolved not in member_symbol_keys:
                 return resolved
         return key
 
@@ -1892,6 +2051,49 @@ def _resolve_python_module_path(module_name: str, current_path: Path, root: Path
             return cand
     return None
 
+def _resolve_python_namespace_dir(module_name: str, current_path: Path, root: Path, level: int) -> "Path | None":
+    """The directory a ``from <module> import ...`` names when that module is a
+    PEP 420 namespace package: a directory under the scan root with no
+    ``__init__.py``. ``_resolve_python_module_path`` returns None for it (there is
+    no module file to probe), so a package that omits ``__init__.py`` -- which
+    ``python -m pkg.mod`` runs without complaint -- had every ``from . import
+    sibling`` dropped whole, and with it every ``sibling.func()`` call the #1883
+    module arm would otherwise have resolved: the most-called functions in such a
+    repo carried in-degree 0. Mirrors that resolver's walk (relative base, then
+    scan root, then sys.path-root ancestors) and returns only a directory that
+    exists inside the root."""
+    def _namespace(candidate: Path) -> "Path | None":
+        if not candidate.is_dir() or (candidate / "__init__.py").is_file():
+            return None
+        try:
+            candidate.resolve().relative_to(root.resolve())
+        except ValueError:
+            return None
+        return candidate
+
+    if level > 0:
+        base = current_path.parent
+        for _ in range(level - 1):
+            base = base.parent
+        return _namespace(base / module_name.replace(".", "/") if module_name else base)
+    if not module_name:
+        return None
+    rel = module_name.replace(".", "/")
+    hit = _namespace(root / rel)
+    if hit is not None:
+        return hit
+    for anc in current_path.parents:
+        try:
+            anc.relative_to(root)
+        except ValueError:
+            break  # left the scan root; stop walking up
+        if anc == root or (anc / "__init__.py").is_file():
+            continue  # root already probed; a package dir is not a sys.path root (#2072)
+        hit = _namespace(anc / rel)
+        if hit is not None:
+            return hit
+    return None
+
 def _python_top_level_function_bodies(path: Path, root_node, source: bytes) -> list[tuple[str, object]]:
     bodies: list[tuple[str, object]] = []
     stem = _file_stem(path)
@@ -1937,13 +2139,21 @@ def _collect_python_symbol_resolution_facts(
                 continue
             level, module_name = module
             target_path = _resolve_python_module_path(module_name, path, root, level)
-            if target_path is None:
-                continue
-            # #1146: `from pkg import submod` — if the target is a package
-            # (__init__.py) and an imported name matches a submodule file on
-            # disk, emit a file-level import edge to that submodule rather
-            # than only to the package.
-            pkg_dir = target_path.parent if target_path.name == "__init__.py" else None
+            if target_path is not None:
+                # #1146: `from pkg import submod` — if the target is a package
+                # (__init__.py) and an imported name matches a submodule file on
+                # disk, emit a file-level import edge to that submodule rather
+                # than only to the package.
+                pkg_dir = target_path.parent if target_path.name == "__init__.py" else None
+            else:
+                # A PEP 420 namespace package: the module names a directory with
+                # no __init__.py, so there is no module file to resolve to, but
+                # the names it imports can still be submodule files on disk.
+                # Without this branch `from . import brain` in such a package
+                # emitted nothing, and `brain.think()` never became an edge.
+                pkg_dir = _resolve_python_namespace_dir(module_name, path, root, level)
+                if pkg_dir is None:
+                    continue
             for imported_name, local_name in _python_imported_names(node, source):
                 line = node.start_point[0] + 1
                 if pkg_dir is not None:
@@ -1953,6 +2163,8 @@ def _collect_python_symbol_resolution_facts(
                     if submodule is not None:
                         facts.module_imports.append((path, submodule, line, local_name))
                         continue
+                if target_path is None:
+                    continue  # a namespace package owns no symbols of its own to bind
                 facts.imports.append(
                     _SymbolImportFact(path, local_name, target_path, imported_name, line)
                 )
